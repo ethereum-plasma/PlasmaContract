@@ -1,62 +1,15 @@
 pragma solidity ^0.4.19;
-
-library MinHeapLib {
-    struct Heap {
-        uint256[] data;
-    }
-
-    function add(Heap storage _heap, uint256 value) internal {
-        _heap.data.length += 1;
-        uint index = _heap.data.length - 1;
-        _heap.data[index] = value;
-
-        // Fix the min heap if it is violated.
-        while (index != 0 && _heap.data[index] < _heap.data[(index - 1) / 2]) {
-            uint256 temp = _heap.data[index];
-            _heap.data[index] = _heap.data[(index - 1) / 2];
-            _heap.data[(index - 1) / 2] = temp;
-            index = (index - 1) / 2;
-        }
-    }
-
-    function peek(Heap storage _heap) view internal returns (uint256 value) {
-        return _heap.data[0];
-    }
-
-    function pop(Heap storage _heap) internal returns (uint256 value) {
-        uint256 root = _heap.data[0];
-        _heap.data[0] = _heap.data[_heap.data.length - 1];
-        _heap.data.length -= 1;
-        heapify(_heap, 0);
-        return root;
-    }
-
-    function heapify(Heap storage _heap, uint i) internal {
-        uint left = 2 * i + 1;
-        uint right = 2 * i + 2;
-        uint smallest = i;
-        if (left < _heap.data.length && _heap.data[left] < _heap.data[i]) {
-            smallest = left;
-        }
-        if (right < _heap.data.length && _heap.data[right] < _heap.data[smallest]) {
-            smallest = right;
-        }
-        if (smallest != i) {
-            uint256 temp = _heap.data[i];
-            _heap.data[i] = _heap.data[smallest];
-            _heap.data[smallest] = temp;
-            heapify(_heap, smallest);
-        }
-    }
-}
+import './RLP.sol';
+import './MinHeap.sol';
 
 contract PlasmaChainManager {
+    using RLP for bytes;
+    using RLP for RLP.RLPItem;
+    using RLP for RLP.Iterator;
     using MinHeapLib for MinHeapLib.Heap;
 
     bytes constant PersonalMessagePrefixBytes = "\x19Ethereum Signed Message:\n68";
-
     uint32 constant blockHeaderLength = 133;
-    uint32 constant transactionLength = 90;
 
     struct BlockHeader {
         uint32 blockNumber;
@@ -79,8 +32,9 @@ contract PlasmaChainManager {
     }
 
     struct WithdrawRecord {
-        uint32 blockNumber;
-        uint32 txIndex;
+        uint256 blockNumber;
+        uint256 txIndex;
+        uint256 oIndex;
         address beneficiary;
         WithdrawStatus status;
         uint256 timeStarted;
@@ -164,9 +118,6 @@ contract PlasmaChainManager {
     event DepositEvent(address from, uint256 amount, uint32 indexed n, uint32 ctr);
 
     function deposit() payable public returns (bool success) {
-        require(msg.value == 1 ether);
-        require(depositCounter < 63);
-
         DepositRecord memory newDeposit = DepositRecord({
             n: lastBlockNumber,
             ctr: depositCounter
@@ -180,8 +131,9 @@ contract PlasmaChainManager {
     event WithdrawalStartedEvent(uint256 withdrawalId);
 
     function startWithdrawal(
-        uint32 blockNumber,
-        uint32 txIndex,
+        uint256 blockNumber,
+        uint256 txIndex,
+        uint256 oIndex,
         bytes targetTx,
         bytes proof
     )
@@ -190,27 +142,27 @@ contract PlasmaChainManager {
     {
         BlockHeader memory header = headers[blockNumber];
         require(header.blockNumber > 0);
-        require(targetTx.length == transactionLength);
+
+        var txList = targetTx.toRLPItem().toList();
+        require(txList.length == 13);
 
         // Check if the target transaction is in the block.
         require(isValidProof(header.merkleRoot, targetTx, proof));
 
         // Check if the transaction owner is the sender.
-        bytes20 txOwner;
-        assembly {
-            txOwner := mload(add(add(targetTx, 5), 0x20))
-        }
-        require(address(txOwner) == msg.sender);
+        address txOwner = txList[6 + 2 * oIndex].toAddress();
+        require(txOwner == msg.sender);
 
         // Check if the withdrawal exists.
-        withdrawalId = uint256(blockNumber) * 1000000000 + uint256(txIndex) * 10000;
+        withdrawalId = blockNumber * 1000000000 + txIndex * 10000 + oIndex;
         WithdrawRecord storage record = withdrawRecords[withdrawalId];
         require(record.blockNumber == 0);
 
         // Construct a new withdrawal and add its ID to the heap.
         record.blockNumber = blockNumber;
         record.txIndex = txIndex;
-        record.beneficiary = address(txOwner);
+        record.oIndex = oIndex;
+        record.beneficiary = txOwner;
         record.status = WithdrawStatus.Created;
         record.timeStarted = now;
         exits.add(withdrawalId);
@@ -223,8 +175,9 @@ contract PlasmaChainManager {
 
     function challengeWithdrawal(
         uint256 withdrawalId,
-        uint32 blockNumber,
-        uint32 txIndex,
+        uint256 blockNumber,
+        uint256 txIndex,
+        uint256 oIndex,
         bytes targetTx,
         bytes proof
     )
@@ -233,7 +186,6 @@ contract PlasmaChainManager {
     {
         BlockHeader memory header = headers[blockNumber];
         require(header.blockNumber > 0);
-        require(targetTx.length == transactionLength);
 
         // Check if the transaction is in the block.
         require(isValidProof(header.merkleRoot, targetTx, proof));
@@ -263,7 +215,7 @@ contract PlasmaChainManager {
     }
 
     event WithdrawalCompleteEvent(uint256 withdrawalId, uint32 indexed n,
-        uint32 blockNumber, uint32 txIndex);
+        uint256 blockNumber, uint256 txIndex);
 
     function finalizeWithdrawal() public returns (bool success) {
         uint256 withdrawalId = exits.peek();
