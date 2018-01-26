@@ -48,4 +48,8 @@ library MinHeapLib {
             heapify(_heap, smallest);
         }
     }
+
+    function isEmpty(Heap storage _heap) view internal returns (bool empty) {
+        return _heap.data.length == 0;
+    }
 }

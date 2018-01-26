@@ -8,21 +8,27 @@ contract PlasmaChainManager {
     using RLP for RLP.Iterator;
     using MinHeapLib for MinHeapLib.Heap;
 
-    bytes constant PersonalMessagePrefixBytes = "\x19Ethereum Signed Message:\n68";
-    uint32 constant blockHeaderLength = 133;
+    bytes constant PersonalMessagePrefixBytes = "\x19Ethereum Signed Message:\n96";
+    uint32 constant blockHeaderLength = 161;
+    uint256 constant exisAgeOffset = 7 days;
+    uint256 constant exitWaitOffset = 14 days;
 
     struct BlockHeader {
-        uint32 blockNumber;
+        uint256 blockNumber;
         bytes32 previousHash;
         bytes32 merkleRoot;
         bytes32 r;
         bytes32 s;
         uint8 v;
+        uint256 timeSubmitted;
     }
 
     struct DepositRecord {
-        uint32 n;
-        uint32 ctr;
+        uint256 blockNumber;
+        uint256 txIndex;
+        address depositor;
+        uint256 amount;
+        uint256 timeCreated;
     }
 
     enum WithdrawStatus {
@@ -36,14 +42,16 @@ contract PlasmaChainManager {
         uint256 txIndex;
         uint256 oIndex;
         address beneficiary;
+        uint256 amount;
         WithdrawStatus status;
         uint256 timeStarted;
         uint256 timeEnded;
     }
 
     address public owner;
-    uint32 public lastBlockNumber;
-    uint32 public depositCounter;
+    uint256 public lastBlockNumber;
+    uint256 public oldBlockNumber;
+    uint256 public txCounter;
     mapping(address => bool) public operators;
     mapping(uint256 => BlockHeader) public headers;
     mapping(address => DepositRecord[]) public depositRecords;
@@ -53,7 +61,8 @@ contract PlasmaChainManager {
     function PlasmaChainManager() public {
         owner = msg.sender;
         lastBlockNumber = 0;
-        depositCounter = 0;
+        oldBlockNumber = 0;
+        txCounter = 0;
     }
 
     function setOperator(address operator, bool status)
@@ -71,7 +80,7 @@ contract PlasmaChainManager {
         require(operators[msg.sender]);
         require(header.length == blockHeaderLength);
 
-        bytes4 blockNumber;
+        bytes32 blockNumber;
         bytes32 previousHash;
         bytes32 merkleRoot;
         bytes32 sigR;
@@ -80,11 +89,11 @@ contract PlasmaChainManager {
         assembly {
             let data := add(header, 0x20)
             blockNumber := mload(data)
-            previousHash := mload(add(data, 4))
-            merkleRoot := mload(add(data, 36))
-            sigR := mload(add(data, 68))
-            sigS := mload(add(data, 100))
-            sigV := mload(add(data, 132))
+            previousHash := mload(add(data, 32))
+            merkleRoot := mload(add(data, 64))
+            sigR := mload(add(data, 96))
+            sigS := mload(add(data, 128))
+            sigV := mload(add(data, 160))
             if lt(sigV, 27) { sigV := add(sigV, 27) }
         }
 
@@ -104,27 +113,34 @@ contract PlasmaChainManager {
             merkleRoot: merkleRoot,
             r: sigR,
             s: sigS,
-            v: uint8(sigV)
+            v: uint8(sigV),
+            timeSubmitted: now
         });
         headers[uint8(blockNumber)] = newHeader;
 
-        // Increment the block number by 1 and reset the deposit counter.
+        // Increment the block number by 1 and reset the transaction counter.
         lastBlockNumber += 1;
-        depositCounter = 0;
+        txCounter = 0;
+
         HeaderSubmittedEvent(signer, uint8(blockNumber));
         return true;
     }
 
-    event DepositEvent(address from, uint256 amount, uint32 indexed n, uint32 ctr);
+    event DepositEvent(address from, uint256 amount,
+        uint256 indexed blockNumber, uint256 txIndex);
 
     function deposit() payable public returns (bool success) {
         DepositRecord memory newDeposit = DepositRecord({
-            n: lastBlockNumber,
-            ctr: depositCounter
+            blockNumber: lastBlockNumber,
+            txIndex: txCounter,
+            depositor: msg.sender,
+            amount: msg.value,
+            timeCreated: now
         });
         depositRecords[msg.sender].push(newDeposit);
-        depositCounter += 1;
-        DepositEvent(msg.sender, msg.value, newDeposit.n, newDeposit.ctr);
+        txCounter += 1;
+        DepositEvent(msg.sender, msg.value, newDeposit.blockNumber,
+            newDeposit.txIndex);
         return true;
     }
 
@@ -153,8 +169,20 @@ contract PlasmaChainManager {
         address txOwner = txList[6 + 2 * oIndex].toAddress();
         require(txOwner == msg.sender);
 
-        // Check if the withdrawal exists.
-        withdrawalId = blockNumber * 1000000000 + txIndex * 10000 + oIndex;
+        // Generate a new withdrawal ID.
+        withdrawalId = header.blockNumber;
+        if (header.timeSubmitted < now - exisAgeOffset) {
+            // The specified block is too old.
+            oldBlockNumber = max(oldBlockNumber, header.blockNumber);
+            while (headers[oldBlockNumber].timeSubmitted < now - exisAgeOffset) {
+                if (headers[oldBlockNumber].timeSubmitted == 0) {
+                    break;
+                }
+                oldBlockNumber += 1;
+            }
+            withdrawalId = oldBlockNumber;
+        }
+        withdrawalId = withdrawalId * 1000000000 + txIndex * 10000 + oIndex;
         WithdrawRecord storage record = withdrawRecords[withdrawalId];
         require(record.blockNumber == 0);
 
@@ -163,6 +191,7 @@ contract PlasmaChainManager {
         record.txIndex = txIndex;
         record.oIndex = oIndex;
         record.beneficiary = txOwner;
+        record.amount = txList[7 + 2 * oIndex].toUint();
         record.status = WithdrawStatus.Created;
         record.timeStarted = now;
         exits.add(withdrawalId);
@@ -187,6 +216,9 @@ contract PlasmaChainManager {
         BlockHeader memory header = headers[blockNumber];
         require(header.blockNumber > 0);
 
+        var txList = targetTx.toRLPItem().toList();
+        require(txList.length == 13);
+
         // Check if the transaction is in the block.
         require(isValidProof(header.merkleRoot, targetTx, proof));
 
@@ -194,17 +226,8 @@ contract PlasmaChainManager {
         WithdrawRecord storage record = withdrawRecords[withdrawalId];
         require(record.blockNumber > 0);
 
-        bytes4 utxoBlockNumber;
-        bytes1 utxoTxIndex;
-        assembly {
-            let data := add(targetTx, 0x20)
-            utxoBlockNumber := mload(data)
-            utxoTxIndex := mload(add(data, 4))
-        }
-
         // The transaction spends the given withdrawal on plasma chain.
-        if (record.blockNumber == uint32(utxoBlockNumber) &&
-            record.txIndex == uint32(utxoTxIndex)) {
+        if (isWithdrawalSpent(targetTx, record)) {
             record.timeEnded = now;
             record.status = WithdrawStatus.Challenged;
             WithdrawalChallengedEvent(withdrawalId);
@@ -214,31 +237,26 @@ contract PlasmaChainManager {
         return false;
     }
 
-    event WithdrawalCompleteEvent(uint256 withdrawalId, uint32 indexed n,
-        uint256 blockNumber, uint256 txIndex);
+    event WithdrawalCompleteEvent(uint256 indexed blockNumber,
+        uint256 exitBlockNumber, uint256 exitTxIndex, uint256 exitOIndex);
 
     function finalizeWithdrawal() public returns (bool success) {
-        uint256 withdrawalId = exits.peek();
-
-        WithdrawRecord storage record = withdrawRecords[withdrawalId];
-
-        // If the top most withdrawal is challenged, just pop it and do nothing.
-        if (record.status == WithdrawStatus.Challenged) {
+        while (!exits.isEmpty() &&
+               now > withdrawRecords[exits.peek()].timeStarted + exitWaitOffset) {
+            WithdrawRecord storage record = withdrawRecords[exits.peek()];
             exits.pop();
-            return false;
+
+            if (record.blockNumber > 0 &&
+                record.status == WithdrawStatus.Created) {
+                record.timeEnded = now;
+                record.status = WithdrawStatus.Complete;
+                record.beneficiary.transfer(record.amount);
+
+                WithdrawalCompleteEvent(lastBlockNumber, record.blockNumber,
+                    record.txIndex, record.oIndex);
+            }
         }
 
-        require(record.blockNumber > 0);
-        require(record.status == WithdrawStatus.Created);
-        // require(now >= record.timeStarted + (7 days));
-        require(now >= record.timeStarted + 1 minutes);
-
-        exits.pop();
-        record.timeEnded = now;
-        record.status = WithdrawStatus.Complete;
-        record.beneficiary.transfer(1 ether);
-        WithdrawalCompleteEvent(withdrawalId, lastBlockNumber,
-            record.blockNumber, record.txIndex);
         return true;
     }
 
@@ -262,5 +280,34 @@ contract PlasmaChainManager {
             }
         }
         return hash == root;
+    }
+
+    function max(uint256 a, uint256 b) pure internal returns (uint256 result) {
+        return (a > b) ? a : b;
+    }
+
+    function isWithdrawalSpent(bytes targetTx, WithdrawRecord record)
+        view
+        internal
+        returns (bool spent)
+    {
+        var txList = targetTx.toRLPItem().toList();
+        require(txList.length == 13);
+
+        // Check two inputs individually if it spent the given withdrawal.
+        for (uint256 i = 0; i < 2; i++) {
+            if (!txList[3 * i].isEmpty()) {
+                uint256 blockNumber = txList[3 * i].toUint();
+                // RLP will encode integer 0 to 0x80 just like empty content...
+                uint256 txIndex = txList[3 * i + 1].isEmpty() ? 0 : txList[3 * i + 1].toUint();
+                uint256 oIndex = txList[3 * i + 2].isEmpty() ? 0 : txList[3 * i + 2].toUint();
+                if (record.blockNumber == blockNumber &&
+                    record.txIndex == txIndex &&
+                    record.oIndex == oIndex) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 }
