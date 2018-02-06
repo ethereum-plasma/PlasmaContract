@@ -1,8 +1,10 @@
 pragma solidity ^0.4.19;
 import './RLP.sol';
 import './MinHeap.sol';
+import './ArrayLib.sol';
 
 contract PlasmaChainManager {
+    using ArrayLib for uint256[];
     using RLP for bytes;
     using RLP for RLP.RLPItem;
     using RLP for RLP.Iterator;
@@ -31,37 +33,28 @@ contract PlasmaChainManager {
         uint256 timeCreated;
     }
 
-    enum WithdrawStatus {
-        Created,
-        Challenged,
-        Complete
-    }
-
     struct WithdrawRecord {
         uint256 blockNumber;
         uint256 txIndex;
         uint256 oIndex;
         address beneficiary;
         uint256 amount;
-        WithdrawStatus status;
-        uint256 timeStarted;
-        uint256 timeEnded;
+        uint256 priority;
     }
 
     address public owner;
     uint256 public lastBlockNumber;
-    uint256 public oldBlockNumber;
     uint256 public txCounter;
     mapping(address => bool) public operators;
     mapping(uint256 => BlockHeader) public headers;
     mapping(address => DepositRecord[]) public depositRecords;
+    mapping(uint256 => uint256[]) public withdrawalIds;
     mapping(uint256 => WithdrawRecord) public withdrawRecords;
     MinHeapLib.Heap exits;
 
     function PlasmaChainManager() public {
         owner = msg.sender;
         lastBlockNumber = 0;
-        oldBlockNumber = 0;
         txCounter = 0;
     }
 
@@ -170,31 +163,21 @@ contract PlasmaChainManager {
         require(txOwner == msg.sender);
 
         // Generate a new withdrawal ID.
-        withdrawalId = header.blockNumber;
-        if (header.timeSubmitted < now - exisAgeOffset) {
-            // The specified block is too old.
-            oldBlockNumber = max(oldBlockNumber, header.blockNumber);
-            while (headers[oldBlockNumber].timeSubmitted < now - exisAgeOffset) {
-                if (headers[oldBlockNumber].timeSubmitted == 0) {
-                    break;
-                }
-                oldBlockNumber += 1;
-            }
-            withdrawalId = oldBlockNumber;
-        }
-        withdrawalId = withdrawalId * 1000000000 + txIndex * 10000 + oIndex;
+        uint256 priority = max(header.timeSubmitted, now - exisAgeOffset);
+        withdrawalId = blockNumber * 1000000 + txIndex * 1000 + oIndex;
         WithdrawRecord storage record = withdrawRecords[withdrawalId];
         require(record.blockNumber == 0);
 
-        // Construct a new withdrawal and add its ID to the heap.
+        // Construct a new withdrawal.
         record.blockNumber = blockNumber;
         record.txIndex = txIndex;
         record.oIndex = oIndex;
         record.beneficiary = txOwner;
         record.amount = txList[7 + 2 * oIndex].toUint();
-        record.status = WithdrawStatus.Created;
-        record.timeStarted = now;
-        exits.add(withdrawalId);
+        record.priority = priority;
+
+        exits.add(priority);
+        withdrawalIds[priority].push(withdrawalId);
 
         WithdrawalStartedEvent(withdrawalId);
         return withdrawalId;
@@ -223,13 +206,14 @@ contract PlasmaChainManager {
         require(isValidProof(header.merkleRoot, targetTx, proof));
 
         // Check if the withdrawal exists.
-        WithdrawRecord storage record = withdrawRecords[withdrawalId];
+        WithdrawRecord memory record = withdrawRecords[withdrawalId];
         require(record.blockNumber > 0);
 
         // The transaction spends the given withdrawal on plasma chain.
         if (isWithdrawalSpent(targetTx, record)) {
-            record.timeEnded = now;
-            record.status = WithdrawStatus.Challenged;
+            withdrawalIds[record.priority].remove(withdrawalId);
+            delete withdrawRecords[withdrawalId];
+
             WithdrawalChallengedEvent(withdrawalId);
             return true;
         }
@@ -241,22 +225,19 @@ contract PlasmaChainManager {
         uint256 exitBlockNumber, uint256 exitTxIndex, uint256 exitOIndex);
 
     function finalizeWithdrawal() public returns (bool success) {
-        while (!exits.isEmpty() &&
-               now > withdrawRecords[exits.peek()].timeStarted + exitWaitOffset) {
-            WithdrawRecord storage record = withdrawRecords[exits.peek()];
-            exits.pop();
-
-            if (record.blockNumber > 0 &&
-                record.status == WithdrawStatus.Created) {
-                record.timeEnded = now;
-                record.status = WithdrawStatus.Complete;
+        while (!exits.isEmpty() && now > exits.peek() + exitWaitOffset) {
+            uint256 priority = exits.pop();
+            for (uint256 i = 0; i < withdrawalIds[priority].length; i++) {
+                uint256 index = withdrawalIds[priority][i];
+                WithdrawRecord memory record = withdrawRecords[index];
                 record.beneficiary.transfer(record.amount);
 
                 WithdrawalCompleteEvent(lastBlockNumber, record.blockNumber,
                     record.txIndex, record.oIndex);
+                delete withdrawRecords[index];
             }
+            delete withdrawalIds[priority];
         }
-
         return true;
     }
 
